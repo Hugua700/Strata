@@ -1,7 +1,9 @@
 @echo off
 rem Strata's HIP (AMD) engine for Windows, and the ready-made zip setup.py downloads (strata-windows-x64-hip.zip).
 rem
-rem   tools\hip\build_windows.bat              build strata.exe + strata-device.exe and package dist\strata-windows-x64-hip.zip
+rem   tools\hip\build_windows.bat              build strata.exe + strata-device.exe + strata-vision.exe (the CPU image
+rem                                              encoder, #881, when a llama.cpp tree is at hand) and package
+rem                                              dist\strata-windows-x64-hip.zip
 rem   tools\hip\build_windows.bat tests        also build the HIP unit tests (ctest in build-hip-win; they need an AMD GPU)
 rem
 rem Needs: Visual Studio 2022 (or 2019) Build Tools with the C++ workload (the linker, the CRT and the Windows SDK),
@@ -77,6 +79,22 @@ if "%TESTS%"=="ON" (
   cmake --build "%BUILD_DIR%" || exit /b 1
 ) else (
   cmake --build "%BUILD_DIR%" --target strata strata-device || exit /b 1
+)
+
+rem ---- 3b. the CPU image encoder (#881), for the zip: a plain MSVC program (llama.cpp's mtmd), so it needs no HIP
+rem      and builds with the vcvars of step 2.  Only when a llama.cpp source tree is at hand (STRATA_GGML_DIR, or
+rem      third_party\llama.cpp); without one the zip carries no encoder, which is what it always did.
+set "VISION_LLAMA="
+if defined STRATA_GGML_DIR if exist "%STRATA_GGML_DIR%\CMakeLists.txt" set "VISION_LLAMA=%STRATA_GGML_DIR%"
+if not defined VISION_LLAMA if exist "%SRC%\third_party\llama.cpp\CMakeLists.txt" set "VISION_LLAMA=%SRC%\third_party\llama.cpp"
+if defined VISION_LLAMA (
+  echo Building the CPU image encoder, strata-vision.exe ...
+  cmake -G Ninja -S "%SRC%\tools\vision" -B "%SRC%\build-vision-win" -DCMAKE_BUILD_TYPE=Release ^
+    "-DLLAMA_DIR=%VISION_LLAMA:\=/%" -DSTRATA_VISION_CUDA=OFF -DSTRATA_PORTABLE=ON || exit /b 1
+  cmake --build "%SRC%\build-vision-win" --target strata-vision || exit /b 1
+  copy /y "%SRC%\build-vision-win\bin\strata-vision.exe" "%BUILD_DIR%\strata-vision.exe" >nul || exit /b 1
+) else (
+  echo Note: no llama.cpp source tree ^(STRATA_GGML_DIR or third_party\llama.cpp^) - the zip gets no image encoder
 )
 
 rem ---- 4. the zip: the two programs, the ROCm DLLs they load (+ rocBLAS/hipBLASLt kernels for these archs), licenses

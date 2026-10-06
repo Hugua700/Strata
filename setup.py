@@ -2550,7 +2550,9 @@ def build_vision_cpu(eng: Path, stamp: Path, meta: dict, llama, vsrc) -> Path:
 
     Where no MSVC is found, the encoder is left out and images stay off: the engine is already installed and works,
     so a machine without the C++ build tools must not lose the engine over it (#881)."""
-    if not ((eng / VEXE).exists() and meta.get("vision_src") == vsrc):
+    # rebuilt when the encoder is missing, or when this checkout's tools/vision changed; a ready-made zip that carries
+    # one records no vision_src (#881) and is taken as it is
+    if not ((eng / VEXE).exists() and (not meta.get("vision_src") or meta.get("vision_src") == vsrc)):
         vcvars = find_vcvars() if WIN else None       # #881: MSVC's environment on Windows, as the CUDA path has
         if WIN and vcvars is None:
             warn("the CPU image encoder needs the Visual Studio C++ build tools: images off (install them, or point "

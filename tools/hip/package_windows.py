@@ -7,6 +7,8 @@
 tools/hip/build_windows.bat runs it after the build.  The zip holds:
 
     strata.exe, strata-device.exe, BUILD.json      (backend "hip", the archs, the ROCm and hipBLASLt versions)
+    strata-vision.exe                              the CPU image encoder, when the build has one (#881): setup.py
+                                                   installs it for --vision cpu, so no C++ toolchain is needed
     amdhip64_7.dll, amd_comgr.dll + what they import   the HIP runtime beside the exes too (#468 #461: before System32)
     rocm/bin/*.dll                                 the ROCm DLLs the two programs load (their import tables, followed
                                                    through the ROCm DLLs, + amd_comgr.dll, which the HIP runtime loads
@@ -34,6 +36,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[2]
 ASSET = "strata-windows-x64-hip.zip"
 PROGRAMS = ("strata.exe", "strata-device.exe")
+VISION = "strata-vision.exe"                     # #881: the CPU image encoder, shipped when the build has one
 DYNAMIC = ("amd_comgr.dll",)                     # LoadLibrary'd by amdhip64_7.dll: not in any import table
 CRT = ("msvcp140.dll", "msvcp140_1.dll", "msvcp140_2.dll", "vcruntime140.dll", "vcruntime140_1.dll")
 KPACKS = ("blas_lib",)       # rocblas.dll's own device code; rocSOLVER's (27 MB per arch) is never launched by Strata
@@ -82,10 +85,16 @@ def main() -> int:
 
     for p in PROGRAMS:
         shutil.copy2(a.build / p, stage / p)
+    # #881: the CPU image encoder when the build has one (build_windows.bat builds it): setup.py installs it for
+    # --vision cpu without a C++ toolchain on the user's PC.  Without it the zip is what it always was.
+    vision = (a.build / VISION).exists()
+    if vision:
+        shutil.copy2(a.build / VISION, stage / VISION)
 
     # the ROCm DLLs: the programs' imports, followed through the ROCm DLLs themselves
     rocm_dlls = {p.name.lower(): p for p in rbin.glob("*.dll")}
-    need, todo, crt = [], [stage / p for p in PROGRAMS] + [rbin / d for d in DYNAMIC], set()
+    exes = [stage / p for p in PROGRAMS] + ([stage / VISION] if vision else [])
+    need, todo, crt = [], exes + [rbin / d for d in DYNAMIC], set()
     while todo:
         f = todo.pop()
         for name in imports(objdump, f):
@@ -153,8 +162,8 @@ def main() -> int:
     hl = (a.rocm / "include" / "hipblaslt" / "hipblaslt-version.h").read_text(encoding="utf-8")
     hlv = [int(re.search(rf"#define\s+HIPBLASLT_VERSION_{k}\s+(\d+)", hl).group(1)) for k in ("MAJOR", "MINOR", "PATCH")]
     meta = {"source": "prebuilt", "backend": "hip", "platform": "windows-x64", "version": version, "archs": archs,
-            "rocm": a.rocm_version, "hipblaslt_version": hlv[0] * 100000 + hlv[1] * 100 + hlv[2], "vision": "none",
-            "lib_dirs": ["rocm/bin"]}
+            "rocm": a.rocm_version, "hipblaslt_version": hlv[0] * 100000 + hlv[1] * 100 + hlv[2],
+            "vision": "cpu" if vision else "none", "lib_dirs": ["rocm/bin"]}
     (stage / "BUILD.json").write_text(json.dumps(meta, indent=1), encoding="utf-8")
 
     z = a.out / ASSET
@@ -165,7 +174,8 @@ def main() -> int:
                 f.write(p, p.relative_to(stage).as_posix())
     size = sum(p.stat().st_size for p in stage.rglob("*") if p.is_file())
     print(f"{z}: {z.stat().st_size / 2**20:.0f} MiB ({size / 2**20:.0f} MiB unpacked), engine {version}, "
-          f"{', '.join(archs)}, ROCm {a.rocm_version}, DLLs: {', '.join(shipped)}")
+          f"{', '.join(archs)}, ROCm {a.rocm_version}, DLLs: {', '.join(shipped)}" +
+          (", image encoder (CPU)" if vision else ""))
     return 0
 
 
