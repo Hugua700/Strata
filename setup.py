@@ -1271,15 +1271,29 @@ def find_nvcc(below=None):
 
 def find_vcvars(cuda_v=None):
     """Visual Studio's vcvars64.bat.  #985: CUDA 13.0-13.2 accept Visual Studio 2019 and 2022 only, so a newer one
-    (2026 = version 18) is taken only with CUDA 13.3 or newer (`cuda_v`, the toolkit's (major, minor))."""
+    (2026 = version 18) is taken only with CUDA 13.3 or newer (`cuda_v`, the toolkit's (major, minor)).
+
+    A caller with no CUDA at all (`cuda_v is None`) asks vswhere for no version range: the CPU image encoder is built
+    by MSVC, which is happy with any version (#881) - and tools/hip/build_windows.bat already calls vswhere that way.
+    STRATA_VCVARS=<vcvars64.bat> picks one by hand, for an install vswhere cannot use (a range-matched broken one,
+    #881)."""
+    override = os.environ.get("STRATA_VCVARS")
+    if override:
+        v = Path(override)
+        return v if v.exists() else None
     vswhere = Path(os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)")) / "Microsoft Visual Studio/Installer/vswhere.exe"
     if not vswhere.exists():
         return None
     # CUDA 13 accepts Visual Studio 2019 and 2022 only: a newer one (2026 = version 18) installed next to them
     # must not be picked ("unsupported Microsoft Visual Studio version"); with only a newer one there is none
-    upper = "19.0" if cuda_v is not None and tuple(cuda_v) >= (13, 3) else "18.0"
-    p = out([str(vswhere), "-latest", "-products", "*", "-version", f"[16.0,{upper})", "-requires",
-             "Microsoft.VisualStudio.Component.VC.Tools.x86.x64", "-property", "installationPath"]).strip()
+    args = [str(vswhere), "-latest", "-products", "*"]
+    if cuda_v is not None:
+        upper = "19.0" if tuple(cuda_v) >= (13, 3) else "18.0"
+        args += ["-version", f"[16.0,{upper})"]
+    args += ["-requires", "Microsoft.VisualStudio.Component.VC.Tools.x86.x64", "-property", "installationPath"]
+    p = out(args).strip()
+    v = Path(p) / "VC/Auxiliary/Build/vcvars64.bat" if p else None
+    return v if v and v.exists() else None
     v = Path(p) / "VC/Auxiliary/Build/vcvars64.bat" if p else None
     return v if v and v.exists() else None
 
@@ -2523,25 +2537,30 @@ def build_engine_hip(gpu, llama, vision="none") -> Path:
 
 def hip_vision(asked) -> str:
     """The image encoder with the AMD backend (--vision): the CPU one when asked for (#304); a HIP (GPU) encoder build
-    is a later step, so `yes`/`gpu` leave images off, as before, and say how to get them."""
+    is a later step, so `yes`/`gpu` leave images off, as before, and say how to get them.  `--vision cpu` means the
+    CPU encoder on every platform: it is a plain MSVC/CMake program, not a HIP target (#881)."""
     if asked in ("yes", "gpu"):
         warn("the AMD backend has no GPU image encoder yet: images off"
              + ("" if WIN else " (--vision cpu reads them on the CPU)"))
-    if asked == "cpu" and WIN:
-        warn("images on the CPU with an AMD card are Linux-only for now (the ready-made Windows AMD engine has no "
-             "image encoder): images off")
-        return "none"
     return "cpu" if asked == "cpu" else "none"
 
 
 def build_vision_cpu(eng: Path, stamp: Path, meta: dict, llama, vsrc) -> Path:
-    """#304: the CPU image encoder beside the HIP engine (tools/vision without CUDA), recorded in its BUILD.json."""
+    """#304: the CPU image encoder beside the HIP engine (tools/vision without CUDA), recorded in its BUILD.json.
+
+    Where no MSVC is found, the encoder is left out and images stay off: the engine is already installed and works,
+    so a machine without the C++ build tools must not lose the engine over it (#881)."""
     if not ((eng / VEXE).exists() and meta.get("vision_src") == vsrc):
+        vcvars = find_vcvars() if WIN else None       # #881: MSVC's environment on Windows, as the CUDA path has
+        if WIN and vcvars is None:
+            warn("the CPU image encoder needs the Visual Studio C++ build tools: images off (install them, or point "
+                 "STRATA_VCVARS at your vcvars64.bat, and run setup again)")
+            stamp.write_text(json.dumps(meta, indent=1))
+            return eng
         say("  Compiling the image encoder (for the CPU) ...")
         cmake_build(ROOT / "tools" / "vision", ROOT / "build-vision", "strata-vision",
                     [f"-DLLAMA_DIR={llama}", "-DSTRATA_VISION_CUDA=OFF", "-DSTRATA_PORTABLE=OFF"],
-                    find_vcvars() if WIN else None,
-                    "build-vision-cpu.bat" if WIN else "")   # #881: MSVC's environment on Windows, as the CUDA path has
+                    vcvars, "build-vision-cpu.bat" if WIN else "")
         shutil.copy2(ROOT / "build-vision" / "bin" / VEXE, eng / VEXE)
     stamp.write_text(json.dumps({**meta, "vision": "cpu", "vision_src": vsrc}, indent=1))
     ok(f"engine: {eng / EXE}, image encoder (CPU): {eng / VEXE}")
@@ -5225,11 +5244,22 @@ def main() -> int:
     else:
         eng = None if a.build or hip else get_prebuilt(a.prebuilt, gpu, vision, **({"toolkit": 12} if cuda_tk == 12
                                                                                     else {}))
-    if eng is not None and not hip and json.loads((eng / "BUILD.json").read_text(encoding="utf-8")).get("source") != "local":
-        pip_cuda_libs(cuda_tk)
+    if eng is not None and json.loads((eng / "BUILD.json").read_text(encoding="utf-8")).get("source") != "local":
+        if not hip:                      # the HIP engine loads AMD's runtime; pip's CUDA wheels are the CUDA engine's
+            pip_cuda_libs(cuda_tk)
         if vision != "none" and not (eng / VEXE).exists():
-            warn("the ready-made engine has no image encoder: compiling it")
-            eng = None
+            if hip:
+                # #881: the ready-made Windows AMD engine ships no image encoder.  Build the CPU encoder beside it and
+                # never the engine itself, which needs the ROCm toolchain the ready-made one exists to avoid.  With no
+                # MSVC, build_vision_cpu() warns and leaves images off instead of stopping setup.
+                stamp = eng / "BUILD.json"
+                build_vision_cpu(eng, stamp, json.loads(stamp.read_text(encoding="utf-8")), llama,
+                                 source_hash(VISION_SOURCES))
+                if not (eng / VEXE).exists():
+                    vision = "none"
+            else:
+                warn("the ready-made engine has no image encoder: compiling it")
+                eng = None
         else:
             vision = prebuilt_vision(json.loads((eng / "BUILD.json").read_text(encoding="utf-8")), gpu, vision)
     if eng is None:
